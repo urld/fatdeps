@@ -1,31 +1,29 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"go/build"
 	"io"
-	"io/ioutil"
-	"log"
 	"math"
+	"net/http"
 	"os"
 	"os/exec"
 	"path"
 	"regexp"
 	"strings"
+	"sync"
 
 	"code.cloudfoundry.org/bytefmt"
 	"github.com/pkg/browser"
 )
 
-var (
-	pkgs      = make(map[string]Package)
-	matchvar  = flag.String("match", ".*", "filter packages")
-	filename  = flag.String("file", "", "dump to file instead of opening in browser")
+var ctx struct {
+	sync.Mutex
+	pkgCount  int64
+	totalSize int64
+	pkgs      map[string]Package
 	pkgmatch  *regexp.Regexp
-	pkgCount  = int64(0)
-	totalSize = int64(0)
-)
+}
 
 type Package struct {
 	idx     int64
@@ -34,55 +32,64 @@ type Package struct {
 	Imports []string
 }
 
-func init() {
-	flag.Parse()
-	pkgmatch = regexp.MustCompile(*matchvar)
-}
-
 func main() {
-	if len(flag.Args()) != 1 {
+	if len(os.Args) != 2 {
 		fmt.Println("exactly 1 package name required")
 		os.Exit(2)
 	}
-	rootPkgName := flag.Arg(0)
+	rootPkgName := os.Args[1]
 
-	findImport(rootPkgName)
-	root := pkgs[rootPkgName]
-	root.Size = totalSize
-	pkgs[rootPkgName] = root
+	browser.OpenURL("http://localhost:8080/" + rootPkgName)
+	http.HandleFunc("/", handler)
+	err := http.ListenAndServe(":8080", nil)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+}
 
-	var file *os.File
-	var err error
-	if *filename == "" {
-		file, err = ioutil.TempFile(os.TempDir(), "fatdeps")
-		check(err)
-		defer os.Remove(file.Name())
-		defer file.Close()
-	} else {
-		file, err = os.OpenFile(*filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
-		check(err)
-		defer file.Close()
+func handler(w http.ResponseWriter, r *http.Request) {
+	pkgName := r.URL.Path[1:]
+	match := r.URL.Query().Get("match")
+	pkgmatch, err := regexp.Compile(match)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
-	renderGraph(file)
-	file.Close()
-	browser.OpenFile(file.Name())
+	ctx.Lock()
+	defer ctx.Unlock()
+	ctx.pkgCount = 0
+	ctx.totalSize = 0
+	ctx.pkgs = make(map[string]Package)
+	ctx.pkgmatch = pkgmatch
+
+	err = findImport(pkgName)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	root := ctx.pkgs[pkgName]
+	root.Size = ctx.totalSize
+	ctx.pkgs[pkgName] = root
+
+	err = renderGraph(w)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 }
 
-func findImport(p string) {
-	if !pkgmatch.MatchString(p) {
-		// doesn't match the filter, skip it
-		return
-	}
+func findImport(p string) error {
 	if p == "C" {
 		// C isn't really a package
-		pkgCount++
-		pkgs["C"] = Package{idx: pkgCount, Name: "C"}
+		ctx.pkgCount++
+		ctx.pkgs["C"] = Package{idx: ctx.pkgCount, Name: "C"}
 	}
-	if _, ok := pkgs[p]; ok {
+	if _, ok := ctx.pkgs[p]; ok {
 		// seen this package before, skip it
-		return
+		return nil
 	}
 	if strings.HasPrefix(p, "golang_org") {
 		p = path.Join("vendor", p)
@@ -90,60 +97,74 @@ func findImport(p string) {
 
 	pkg, err := build.Import(p, "", 0)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	pkgs[p] = analyze(pkg, p)
-	for _, pkg := range pkgs[p].Imports {
-		findImport(pkg)
+	ctx.pkgs[p] = analyze(pkg, p)
+	for _, pkg := range ctx.pkgs[p].Imports {
+		err = findImport(pkg)
+		if err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func analyze(pkg *build.Package, alias string) Package {
-	imports := filter(pkg.Imports)
+	imports := pkg.Imports
 	var size int64
 	info, err := os.Stat(pkg.PkgObj)
 	if err == nil {
 		size = info.Size()
-		totalSize += size
+		ctx.totalSize += size
 	}
-	pkgCount++
-	return Package{idx: pkgCount, Name: alias, Size: size, Imports: imports}
+	ctx.pkgCount++
+	return Package{idx: ctx.pkgCount, Name: alias, Size: size, Imports: imports}
 }
 
-func filter(s []string) []string {
-	var r []string
-	for _, v := range s {
-		if pkgmatch.MatchString(v) {
-			r = append(r, v)
-		}
-	}
-	return r
-}
-
-func renderGraph(w io.Writer) {
+func renderGraph(w io.Writer) error {
 	cmd := exec.Command("dot", "-Tsvg")
 	in, err := cmd.StdinPipe()
-	check(err)
+	if err != nil {
+		return err
+	}
 	out, err := cmd.StdoutPipe()
 	cmd.Stderr = os.Stderr
-	check(cmd.Start())
+	err = cmd.Start()
+	if err != nil {
+		return err
+	}
 
 	fmt.Fprintf(in, "digraph \"\" {\n")
-	for _, pkg := range pkgs {
-		printNode(in, pkg)
+	for _, pkg := range ctx.pkgs {
+		if ctx.pkgmatch.MatchString(pkg.Name) {
+			printNode(in, pkg)
+		}
 	}
-	for _, pkg := range pkgs {
+	for _, pkg := range ctx.pkgs {
 		if pkg.Imports == nil {
 			continue
 		}
+		if !ctx.pkgmatch.MatchString(pkg.Name) {
+			continue
+		}
+
 		for _, pkgImport := range pkg.Imports {
-			printEdge(in, pkg, pkgs[pkgImport])
+			if ctx.pkgmatch.MatchString(pkgImport) {
+				printEdge(in, pkg, ctx.pkgs[pkgImport])
+			}
 		}
 	}
 	fmt.Fprintf(in, "}\n")
 	in.Close()
-	io.Copy(w, out)
-	check(cmd.Wait())
+	_, err = io.Copy(w, out)
+	if err != nil {
+		return err
+	}
+	err = cmd.Wait()
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func printEdge(w io.Writer, pkg, pkgImport Package) {
@@ -153,25 +174,19 @@ func printEdge(w io.Writer, pkg, pkgImport Package) {
 
 func printNode(w io.Writer, pkg Package) {
 	if pkg.Size > 0 {
-		ratio := float64(pkg.Size) / float64(totalSize)
+		ratio := float64(pkg.Size) / float64(ctx.totalSize)
 		// Scale font sizes from 8 to 32 based on percentage of flat frequency.
 		// Use non linear growth to emphasize the size difference.
 		baseFontSize, maxFontGrowth := 10, 24.0
 		fontSize := baseFontSize
-		if pkg.Size != totalSize {
+		if pkg.Size != ctx.totalSize {
 			fontSize += int(math.Ceil(maxFontGrowth * math.Sqrt(ratio)))
 		}
 
-		label := fmt.Sprintf("%s\n%s (%f%%)", pkg.Name, bytefmt.ByteSize(uint64(pkg.Size)), ratio*100)
-		fmt.Fprintf(w, "\tN%d [label=%q,shape=box fontsize=%d];\n", pkg.idx, label, fontSize)
+		label := fmt.Sprintf("%s\n%sB (%f%%)", pkg.Name, bytefmt.ByteSize(uint64(pkg.Size)), ratio*100)
+		url := "/" + pkg.Name
+		fmt.Fprintf(w, "\tN%d [label=%q,shape=box fontsize=%d URL=%q];\n", pkg.idx, label, fontSize, url)
 	} else {
 		fmt.Fprintf(w, "\tN%d [label=%q,shape=box];\n", pkg.idx, pkg.Name)
-	}
-}
-
-func check(err error) {
-
-	if err != nil {
-		log.Fatal(err)
 	}
 }

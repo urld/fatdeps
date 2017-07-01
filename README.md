@@ -17,12 +17,17 @@ First install [graphviz](http://graphviz.org/Download.php) for your OS, then
 
 ## Usage
 
+Start a http server and open the graph in browser:
 ```fatdeps github.com/urld/helloworld```
+All the nodes are linked.
+You can also use filter nodes:
+```http://localhost:8080/github.com/urld/helloworld?match=runtime```
 
 ![Example](https://github.com/urld/fatdeps/raw/master/example.png)
 
 
+
 ## TODO
 
-* http server for interactive graph navigation
 * show cumulative sizes
+* improve filter
