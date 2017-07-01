@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"go/build"
 	"io"
@@ -33,15 +34,22 @@ type Package struct {
 }
 
 func main() {
-	if len(os.Args) != 2 {
+	addr := flag.String("http", ":8080", "HTTP Service address")
+	flag.Parse()
+	if len(flag.Args()) != 1 {
 		fmt.Println("exactly 1 package name required")
 		os.Exit(2)
 	}
-	rootPkgName := os.Args[1]
+	rootPkgName := flag.Arg(0)
 
-	browser.OpenURL("http://localhost:8080/" + rootPkgName)
+	if strings.HasPrefix(*addr, ":") {
+		browser.OpenURL("http://localhost" + *addr + "/" + rootPkgName)
+
+	} else {
+		browser.OpenURL("http://" + *addr + "/" + rootPkgName)
+	}
 	http.HandleFunc("/", handler)
-	err := http.ListenAndServe(":8080", nil)
+	err := http.ListenAndServe(*addr, nil)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
