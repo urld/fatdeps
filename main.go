@@ -1,3 +1,16 @@
+// Fatdeps lets you analyze the sizes of a packages dependencies.
+// The command starts a http server which serves interactive graphs.
+//
+// This command requires graphviz to be installed.
+//
+// Usage of fatdeps:
+//  -http string
+//    	HTTP Service address (default ":8080")
+//
+// Example:
+//  fatdeps -http :9999 github.com/urld/fatdeps
+//
+// Visit https://github.com/urld/fatdeps for screenshots.
 package main
 
 import (

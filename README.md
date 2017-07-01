@@ -8,6 +8,8 @@ This is inspired this article: [A Story of a Fat Go Binary](https://hackernoon.c
 
 The implementation is based on [github.com/davecheney/graphpkg](https://github.com/davecheney/graphpkg/).
 
+Note that the actual binary will usually have a much smaller size, since only the intermediate '.a' files
+of the packages are analyzed.
 
 ## Installation
 
@@ -18,10 +20,12 @@ First install [graphviz](http://graphviz.org/Download.php) for your OS, then
 ## Usage
 
 Start a http server and open the graph in browser:
-```fatdeps github.com/urld/helloworld```
-All the nodes are linked.
-You can also use filter nodes:
-```http://localhost:8080/github.com/urld/helloworld?match=runtime```
+
+	fatdeps github.com/urld/helloworld
+
+All the nodes are linked. You can also filter nodes with a query parameter:
+
+	http://localhost:8080/github.com/urld/helloworld?match=runtime
 
 ![Example](https://github.com/urld/fatdeps/raw/master/example.png)
 
