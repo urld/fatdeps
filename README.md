@@ -1,5 +1,6 @@
 # fatdeps
 
+[![Go Report Card](https://goreportcard.com/badge/github.com/urld/fatdeps)](https://goreportcard.com/report/github.com/urld/fatdeps)
 [![GoDoc](https://godoc.org/github.com/urld/fatdeps?status.svg)](https://godoc.org/github.com/urld/fatdeps)
 
 `fatdeps` generates package dependency graphs for Go packages, and shows the size of each package.
@@ -33,5 +34,4 @@ All the nodes are linked. You can also filter nodes with a query parameter:
 
 ## TODO
 
-* show cumulative sizes
 * improve filter

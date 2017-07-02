@@ -33,15 +33,17 @@ import (
 
 var ctx struct {
 	sync.Mutex
-	pkgCount  int64
-	totalSize int64
-	pkgs      map[string]Package
-	pkgmatch  *regexp.Regexp
+	pkgCount int64
+	flatSize int64
+	cumSize  int64
+	pkgs     map[string]Package
+	pkgmatch *regexp.Regexp
 }
 
 type Package struct {
 	idx     int64
 	Size    int64
+	CumSize int64
 	Name    string
 	Imports []string
 }
@@ -81,17 +83,18 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	ctx.Lock()
 	defer ctx.Unlock()
 	ctx.pkgCount = 0
-	ctx.totalSize = 0
+	ctx.flatSize = 0
+	ctx.cumSize = 0
 	ctx.pkgs = make(map[string]Package)
 	ctx.pkgmatch = pkgmatch
 
-	err = findImport(pkgName)
+	root, err := findImport(pkgName)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	root := ctx.pkgs[pkgName]
-	root.Size = ctx.totalSize
+	root.Size = ctx.flatSize
+	ctx.cumSize = root.CumSize
 	ctx.pkgs[pkgName] = root
 
 	err = renderGraph(w)
@@ -102,32 +105,35 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func findImport(p string) error {
+func findImport(p string) (Package, error) {
 	if p == "C" {
 		// C isn't really a package
 		ctx.pkgCount++
 		ctx.pkgs["C"] = Package{idx: ctx.pkgCount, Name: "C"}
 	}
-	if _, ok := ctx.pkgs[p]; ok {
+	if pkg, ok := ctx.pkgs[p]; ok {
 		// seen this package before, skip it
-		return nil
+		return pkg, nil
 	}
 	if strings.HasPrefix(p, "golang_org") {
 		p = path.Join("vendor", p)
 	}
 
-	pkg, err := build.Import(p, "", 0)
+	builtPkg, err := build.Import(p, "", 0)
 	if err != nil {
-		return err
+		return Package{}, err
 	}
-	ctx.pkgs[p] = analyze(pkg, p)
-	for _, pkg := range ctx.pkgs[p].Imports {
-		err = findImport(pkg)
+	pkg := analyze(builtPkg, p)
+	ctx.pkgs[p] = pkg
+	for _, pkgImport := range pkg.Imports {
+		importPkg, err := findImport(pkgImport)
 		if err != nil {
-			return err
+			return pkg, err
 		}
+		pkg.CumSize += importPkg.CumSize
 	}
-	return nil
+	ctx.pkgs[p] = pkg
+	return pkg, nil
 }
 
 func analyze(pkg *build.Package, alias string) Package {
@@ -136,10 +142,10 @@ func analyze(pkg *build.Package, alias string) Package {
 	info, err := os.Stat(pkg.PkgObj)
 	if err == nil {
 		size = info.Size()
-		ctx.totalSize += size
+		ctx.flatSize += size
 	}
 	ctx.pkgCount++
-	return Package{idx: ctx.pkgCount, Name: alias, Size: size, Imports: imports}
+	return Package{idx: ctx.pkgCount, Name: alias, Size: size, CumSize: size, Imports: imports}
 }
 
 func renderGraph(w io.Writer) error {
@@ -189,18 +195,29 @@ func renderGraph(w io.Writer) error {
 }
 
 func printEdge(w io.Writer, pkg, pkgImport Package) {
-	label := pkg.Name + " -> " + pkgImport.Name
-	fmt.Fprintf(w, "\tN%d -> N%d [weight=1 tooltip=%q];\n", pkg.idx, pkgImport.idx, label)
+	tooltip := pkg.Name + " -> " + pkgImport.Name
+	if pkg.Size > 0 {
+		ratio := float64(pkgImport.CumSize) / float64(ctx.cumSize)
+		baseWidth, maxWidthGrowth := 1.0, 6.0
+		width := baseWidth
+		width += maxWidthGrowth * math.Sqrt(ratio)
+
+		label := fmt.Sprintf(" %sB", bytefmt.ByteSize(uint64(pkgImport.CumSize)))
+		fmt.Fprintf(w, "\tN%d -> N%d [weight=1 penwidth=%f label=%q tooltip=%q labeltooltip=%q];\n",
+			pkg.idx, pkgImport.idx, width, label, tooltip, tooltip)
+	} else {
+		fmt.Fprintf(w, "\tN%d -> N%d [weight=1 tooltip=%q];\n", pkg.idx, pkgImport.idx, tooltip)
+	}
 }
 
 func printNode(w io.Writer, pkg Package) {
 	if pkg.Size > 0 {
-		ratio := float64(pkg.Size) / float64(ctx.totalSize)
+		ratio := float64(pkg.Size) / float64(ctx.flatSize)
 		// Scale font sizes from 8 to 32 based on percentage of flat frequency.
 		// Use non linear growth to emphasize the size difference.
 		baseFontSize, maxFontGrowth := 10, 24.0
 		fontSize := baseFontSize
-		if pkg.Size != ctx.totalSize {
+		if pkg.Size != ctx.flatSize {
 			fontSize += int(math.Ceil(maxFontGrowth * math.Sqrt(ratio)))
 		}
 
