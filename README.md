@@ -9,9 +9,6 @@ This is inspired this article: [A Story of a Fat Go Binary](https://hackernoon.c
 
 The implementation is based on [github.com/davecheney/graphpkg](https://github.com/davecheney/graphpkg/).
 
-Note that the actual binary will usually have a much smaller size, since only the intermediate '.a' files
-of the packages are analyzed.
-
 ## Installation
 
 First install [graphviz](http://graphviz.org/Download.php) for your OS, then
@@ -27,6 +24,12 @@ Start a http server and open the graph in browser:
 All the nodes are linked. You can also filter nodes with a query parameter:
 
 	http://localhost:8080/github.com/urld/helloworld?match=runtime
+	
+To get more detailed size information you can set the parameter ```symsize=true```:
+
+	http://localhost:8080/github.com/urld/helloworld?symsize=true
+
+This only works for commands and requires the compiled binary to be present in ```$GOBIN```.
 
 ![Example](https://github.com/urld/fatdeps/raw/master/example.png)
 

@@ -14,6 +14,7 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"go/build"
@@ -24,6 +25,7 @@ import (
 	"os/exec"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -33,19 +35,23 @@ import (
 
 var ctx struct {
 	sync.Mutex
-	pkgCount int64
-	flatSize int64
-	cumSize  int64
-	pkgs     map[string]Package
-	pkgmatch *regexp.Regexp
+	pkgCount    int64
+	flatSize    int64
+	symFlatSize int64
+	cumSize     int64
+	symsizes    bool
+	pkgmatch    *regexp.Regexp
+	pkgs        map[string]Package
 }
 
 type Package struct {
-	idx     int64
-	Size    int64
-	CumSize int64
-	Name    string
-	Imports []string
+	idx        int64
+	Size       int64
+	CumSize    int64
+	SymSize    int64
+	CumSymSize int64
+	Name       string
+	Imports    []string
 }
 
 func main() {
@@ -84,9 +90,11 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	defer ctx.Unlock()
 	ctx.pkgCount = 0
 	ctx.flatSize = 0
+	ctx.symFlatSize = 0
 	ctx.cumSize = 0
-	ctx.pkgs = make(map[string]Package)
+	ctx.symsizes = strings.ToLower(r.URL.Query().Get("symsize")) == "true"
 	ctx.pkgmatch = pkgmatch
+	ctx.pkgs = make(map[string]Package)
 
 	root, err := findImport(pkgName)
 	if err != nil {
@@ -96,6 +104,14 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	root.Size = ctx.flatSize
 	ctx.cumSize = root.CumSize
 	ctx.pkgs[pkgName] = root
+
+	if ctx.symsizes {
+		err := collectSymSizes(pkgName)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
 
 	err = renderGraph(w)
 	if err != nil {
@@ -134,6 +150,80 @@ func findImport(p string) (Package, error) {
 	}
 	ctx.pkgs[p] = pkg
 	return pkg, nil
+}
+
+func collectSymSizes(pkgName string) error {
+	builtPkg, err := build.Import(pkgName, "", 0)
+	if err != nil {
+		return err
+	}
+	if !builtPkg.IsCommand() {
+		return fmt.Errorf("symbol sizes can only be determined from complete binaries (commands)")
+	}
+	binary := path.Join(builtPkg.BinDir, path.Base(pkgName))
+
+	cmd := exec.Command("go", "tool", "nm", "-size", binary)
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	symsizes := make(map[string]int64)
+	s := bufio.NewScanner(out)
+	// collect all symbols
+	for s.Scan() {
+		line := s.Text()
+		if strings.HasPrefix(line, "    ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		size, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			return err
+		}
+		if size > 0 {
+			symname := fields[3]
+			symsizes[symname] += size
+			ctx.symFlatSize += size
+		}
+	}
+
+	if err := cmd.Wait(); err != nil {
+		return err
+	}
+
+	// assign symbols to pkgs
+	for pkgKey, pkgVal := range ctx.pkgs {
+		for symKey, symSize := range symsizes {
+			if strings.HasPrefix(symKey, pkgKey+".") {
+				pkgVal.SymSize += symSize
+				delete(symsizes, symKey)
+			}
+		}
+		ctx.pkgs[pkgKey] = pkgVal
+	}
+
+	// add remaining symbols to runtime pkg
+	var mainSize int64
+	var remainingSize int64
+	for symKey, symSize := range symsizes {
+		if strings.HasPrefix(symKey, "main") {
+			mainSize += symSize
+		}
+		remainingSize += symSize
+	}
+	rtPkg := ctx.pkgs["runtime"]
+	rtPkg.SymSize += remainingSize
+	ctx.pkgs["runtime"] = rtPkg
+
+	mainPkg := ctx.pkgs[pkgName]
+	mainPkg.SymSize += mainSize
+	ctx.pkgs[pkgName] = mainPkg
+
+	return nil
 }
 
 func analyze(pkg *build.Package, alias string) Package {
@@ -199,10 +289,13 @@ func printEdge(w io.Writer, pkg, pkgImport Package) {
 	if pkg.Size > 0 {
 		ratio := float64(pkgImport.CumSize) / float64(ctx.cumSize)
 		baseWidth, maxWidthGrowth := 1.0, 6.0
+		size := pkgImport.CumSize
 		width := baseWidth
+		if ctx.symsizes {
+			// TODO
+		}
 		width += maxWidthGrowth * math.Sqrt(ratio)
-
-		label := fmt.Sprintf(" %sB", bytefmt.ByteSize(uint64(pkgImport.CumSize)))
+		label := fmt.Sprintf(" %s", fmtSize(size))
 		fmt.Fprintf(w, "\tN%d -> N%d [weight=1 penwidth=%f label=%q tooltip=%q labeltooltip=%q];\n",
 			pkg.idx, pkgImport.idx, width, label, tooltip, tooltip)
 	} else {
@@ -213,6 +306,12 @@ func printEdge(w io.Writer, pkg, pkgImport Package) {
 func printNode(w io.Writer, pkg Package) {
 	if pkg.Size > 0 {
 		ratio := float64(pkg.Size) / float64(ctx.flatSize)
+		label := fmt.Sprintf("%s\nobjfile: %s (%.2f%%)", pkg.Name, fmtSize(pkg.Size), ratio*100)
+		if ctx.symsizes {
+			ratio = float64(pkg.SymSize) / float64(ctx.symFlatSize)
+			label += fmt.Sprintf("\nsymsize: %s (%.2f%%)", fmtSize(pkg.SymSize), ratio*100)
+		}
+
 		// Scale font sizes from 8 to 32 based on percentage of flat frequency.
 		// Use non linear growth to emphasize the size difference.
 		baseFontSize, maxFontGrowth := 10, 24.0
@@ -221,10 +320,16 @@ func printNode(w io.Writer, pkg Package) {
 			fontSize += int(math.Ceil(maxFontGrowth * math.Sqrt(ratio)))
 		}
 
-		label := fmt.Sprintf("%s\n%sB (%f%%)", pkg.Name, bytefmt.ByteSize(uint64(pkg.Size)), ratio*100)
 		url := "/" + pkg.Name
 		fmt.Fprintf(w, "\tN%d [label=%q,shape=box fontsize=%d URL=%q];\n", pkg.idx, label, fontSize, url)
 	} else {
 		fmt.Fprintf(w, "\tN%d [label=%q,shape=box];\n", pkg.idx, pkg.Name)
 	}
+}
+
+func fmtSize(size int64) string {
+	if size < bytefmt.KILOBYTE {
+		return bytefmt.ByteSize(uint64(size))
+	}
+	return bytefmt.ByteSize(uint64(size)) + "B"
 }
