@@ -14,18 +14,14 @@
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
-	"go/build"
 	"io"
 	"math"
 	"net/http"
 	"os"
 	"os/exec"
-	"path"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -119,123 +115,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-}
-
-func findImport(p string) (Package, error) {
-	if p == "C" {
-		// C isn't really a package
-		ctx.pkgCount++
-		ctx.pkgs["C"] = Package{idx: ctx.pkgCount, Name: "C"}
-	}
-	if pkg, ok := ctx.pkgs[p]; ok {
-		// seen this package before, skip it
-		return pkg, nil
-	}
-	if strings.HasPrefix(p, "golang_org") {
-		p = path.Join("vendor", p)
-	}
-
-	builtPkg, err := build.Import(p, "", 0)
-	if err != nil {
-		return Package{}, err
-	}
-	pkg := analyze(builtPkg, p)
-	ctx.pkgs[p] = pkg
-	for _, pkgImport := range pkg.Imports {
-		importPkg, err := findImport(pkgImport)
-		if err != nil {
-			return pkg, err
-		}
-		pkg.CumSize += importPkg.CumSize
-	}
-	ctx.pkgs[p] = pkg
-	return pkg, nil
-}
-
-func collectSymSizes(pkgName string) error {
-	builtPkg, err := build.Import(pkgName, "", 0)
-	if err != nil {
-		return err
-	}
-	if !builtPkg.IsCommand() {
-		return fmt.Errorf("symbol sizes can only be determined from complete binaries (commands)")
-	}
-	binary := path.Join(builtPkg.BinDir, path.Base(pkgName))
-
-	cmd := exec.Command("go", "tool", "nm", "-size", binary)
-	out, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-
-	symsizes := make(map[string]int64)
-	s := bufio.NewScanner(out)
-	// collect all symbols
-	for s.Scan() {
-		line := s.Text()
-		if strings.HasPrefix(line, "    ") {
-			continue
-		}
-		fields := strings.Fields(line)
-		size, err := strconv.ParseInt(fields[1], 10, 64)
-		if err != nil {
-			return err
-		}
-		if size > 0 {
-			symname := fields[3]
-			symsizes[symname] += size
-			ctx.symFlatSize += size
-		}
-	}
-
-	if err := cmd.Wait(); err != nil {
-		return err
-	}
-
-	// assign symbols to pkgs
-	for pkgKey, pkgVal := range ctx.pkgs {
-		for symKey, symSize := range symsizes {
-			if strings.HasPrefix(symKey, pkgKey+".") {
-				pkgVal.SymSize += symSize
-				delete(symsizes, symKey)
-			}
-		}
-		ctx.pkgs[pkgKey] = pkgVal
-	}
-
-	// add remaining symbols to runtime pkg
-	var mainSize int64
-	var remainingSize int64
-	for symKey, symSize := range symsizes {
-		if strings.HasPrefix(symKey, "main") {
-			mainSize += symSize
-		}
-		remainingSize += symSize
-	}
-	rtPkg := ctx.pkgs["runtime"]
-	rtPkg.SymSize += remainingSize
-	ctx.pkgs["runtime"] = rtPkg
-
-	mainPkg := ctx.pkgs[pkgName]
-	mainPkg.SymSize += mainSize
-	ctx.pkgs[pkgName] = mainPkg
-
-	return nil
-}
-
-func analyze(pkg *build.Package, alias string) Package {
-	imports := pkg.Imports
-	var size int64
-	info, err := os.Stat(pkg.PkgObj)
-	if err == nil {
-		size = info.Size()
-		ctx.flatSize += size
-	}
-	ctx.pkgCount++
-	return Package{idx: ctx.pkgCount, Name: alias, Size: size, CumSize: size, Imports: imports}
 }
 
 func renderGraph(w io.Writer) error {
