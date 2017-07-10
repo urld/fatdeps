@@ -10,16 +10,24 @@ import (
 	"strings"
 )
 
-func collectSymSizes(pkgName string) error {
-	builtPkg, err := build.Import(pkgName, "", 0)
+func collectSymbols() error {
+	if !ctx.symsizes {
+		return nil
+	}
+
+	// check if pkgName is command first
+	builtPkg, err := build.Import(ctx.pkgName, "", 0)
 	if err != nil {
 		return err
 	}
 	if !builtPkg.IsCommand() {
-		return fmt.Errorf("symbol sizes can only be determined from complete binaries (commands)")
+		fmt.Println("Warning: symbol sizes can only be determined for commands. (" + ctx.pkgName + ")")
+		ctx.symsizes = false
+		return nil
 	}
-	binary := path.Join(builtPkg.BinDir, path.Base(pkgName))
 
+	// call 'go tool nm' to collect symbol sizes
+	binary := path.Join(builtPkg.BinDir, path.Base(ctx.pkgName))
 	cmd := exec.Command("go", "tool", "nm", "-size", binary)
 	out, err := cmd.StdoutPipe()
 	if err != nil {
@@ -29,9 +37,8 @@ func collectSymSizes(pkgName string) error {
 		return err
 	}
 
-	symsizes := make(map[string]int64)
+	// parse output of 'go tool nm'
 	s := bufio.NewScanner(out)
-	// collect all symbols
 	for s.Scan() {
 		line := s.Text()
 		if strings.HasPrefix(line, "    ") {
@@ -44,42 +51,34 @@ func collectSymSizes(pkgName string) error {
 		}
 		if size > 0 {
 			symname := fields[3]
-			symsizes[symname] += size
-			ctx.symFlatSize += size
+			ctx.symbols[symname] += size
+			ctx.flatSymSize += size
 		}
 	}
 
-	if err := cmd.Wait(); err != nil {
-		return err
-	}
+	return cmd.Wait()
+}
 
-	// assign symbols to pkgs
-	for pkgKey, pkgVal := range ctx.pkgs {
-		for symKey, symSize := range symsizes {
-			if strings.HasPrefix(symKey, pkgKey+".") {
-				pkgVal.SymSize += symSize
-				delete(symsizes, symKey)
-			}
+func analyzeSymbols(pkg *Package) {
+	for sym, size := range ctx.symbols {
+		if strings.HasPrefix(sym, pkg.Name+".") {
+			pkg.SymSize += size
+			delete(ctx.symbols, sym)
 		}
-		ctx.pkgs[pkgKey] = pkgVal
 	}
+}
 
-	// add remaining symbols to runtime pkg
+func analyzeRemainingSymbols(mainPkgName string) {
 	var mainSize int64
 	var remainingSize int64
-	for symKey, symSize := range symsizes {
-		if strings.HasPrefix(symKey, "main") {
-			mainSize += symSize
+	for sym, size := range ctx.symbols {
+		if strings.HasPrefix(sym, "main") {
+			mainSize += size
 		}
-		remainingSize += symSize
+		remainingSize += size
 	}
-	rtPkg := ctx.pkgs["runtime"]
-	rtPkg.SymSize += remainingSize
-	ctx.pkgs["runtime"] = rtPkg
 
-	mainPkg := ctx.pkgs[pkgName]
-	mainPkg.SymSize += mainSize
-	ctx.pkgs[pkgName] = mainPkg
+	ctx.pkgs[mainPkgName].SymSize += mainSize
+	ctx.pkgs["runtime"].SymSize += remainingSize
 
-	return nil
 }

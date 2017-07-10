@@ -33,14 +33,18 @@ var ctx struct {
 	sync.Mutex
 	pkgCount    int64
 	flatSize    int64
-	symFlatSize int64
+	flatSymSize int64
 	cumSize     int64
+	cumSymSize  int64
 	symsizes    bool
 	pkgmatch    *regexp.Regexp
-	pkgs        map[string]Package
+	symbols     map[string]int64
+	pkgs        map[string]*Package
+	pkgName     string
 }
 
 type Package struct {
+	processed  bool
 	idx        int64
 	Size       int64
 	CumSize    int64
@@ -86,28 +90,31 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	defer ctx.Unlock()
 	ctx.pkgCount = 0
 	ctx.flatSize = 0
-	ctx.symFlatSize = 0
+	ctx.flatSymSize = 0
 	ctx.cumSize = 0
 	ctx.symsizes = strings.ToLower(r.URL.Query().Get("symsize")) == "true"
 	ctx.pkgmatch = pkgmatch
-	ctx.pkgs = make(map[string]Package)
+	ctx.symbols = make(map[string]int64)
+	ctx.pkgs = make(map[string]*Package)
+	ctx.pkgName = pkgName
+
+	err = collectSymbols()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	root, err := findImport(pkgName)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	analyzeRemainingSymbols(pkgName)
+	calcCumSum(root)
+
 	root.Size = ctx.flatSize
 	ctx.cumSize = root.CumSize
-	ctx.pkgs[pkgName] = root
-
-	if ctx.symsizes {
-		err := collectSymSizes(pkgName)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	}
+	ctx.cumSymSize = root.CumSymSize
 
 	err = renderGraph(w)
 	if err != nil {
@@ -133,7 +140,7 @@ func renderGraph(w io.Writer) error {
 	fmt.Fprintf(in, "digraph \"\" {\n")
 	for _, pkg := range ctx.pkgs {
 		if ctx.pkgmatch.MatchString(pkg.Name) {
-			printNode(in, pkg)
+			printNode(in, *pkg)
 		}
 	}
 	for _, pkg := range ctx.pkgs {
@@ -146,7 +153,7 @@ func renderGraph(w io.Writer) error {
 
 		for _, pkgImport := range pkg.Imports {
 			if ctx.pkgmatch.MatchString(pkgImport) {
-				printEdge(in, pkg, ctx.pkgs[pkgImport])
+				printEdge(in, *pkg, *ctx.pkgs[pkgImport])
 			}
 		}
 	}
@@ -167,15 +174,17 @@ func printEdge(w io.Writer, pkg, pkgImport Package) {
 	tooltip := pkg.Name + " -> " + pkgImport.Name
 	if pkg.Size > 0 {
 		ratio := float64(pkgImport.CumSize) / float64(ctx.cumSize)
-		baseWidth, maxWidthGrowth := 1.0, 6.0
-		size := pkgImport.CumSize
-		width := baseWidth
+		label := fmt.Sprintf(" obj: %s", fmtSize(pkgImport.CumSize))
 		if ctx.symsizes {
-			// TODO
+			ratio = float64(pkgImport.CumSymSize) / float64(ctx.cumSymSize)
+			label += fmt.Sprintf("\n sym: %s", fmtSize(pkgImport.CumSymSize))
 		}
+
+		baseWidth, maxWidthGrowth := 1.0, 6.0
+		width := baseWidth
 		width += maxWidthGrowth * math.Sqrt(ratio)
-		label := fmt.Sprintf(" %s", fmtSize(size))
-		fmt.Fprintf(w, "\tN%d -> N%d [weight=1 penwidth=%f label=%q tooltip=%q labeltooltip=%q];\n",
+
+		fmt.Fprintf(w, "\tN%d -> N%d [weight=1 penwidth=%f label=%q tooltip=%q labeltooltip=%q fontsize=11];\n",
 			pkg.idx, pkgImport.idx, width, label, tooltip, tooltip)
 	} else {
 		fmt.Fprintf(w, "\tN%d -> N%d [weight=1 tooltip=%q];\n", pkg.idx, pkgImport.idx, tooltip)
@@ -187,7 +196,7 @@ func printNode(w io.Writer, pkg Package) {
 		ratio := float64(pkg.Size) / float64(ctx.flatSize)
 		label := fmt.Sprintf("%s\nobjfile: %s (%.2f%%)", pkg.Name, fmtSize(pkg.Size), ratio*100)
 		if ctx.symsizes {
-			ratio = float64(pkg.SymSize) / float64(ctx.symFlatSize)
+			ratio = float64(pkg.SymSize) / float64(ctx.flatSymSize)
 			label += fmt.Sprintf("\nsymsize: %s (%.2f%%)", fmtSize(pkg.SymSize), ratio*100)
 		}
 
